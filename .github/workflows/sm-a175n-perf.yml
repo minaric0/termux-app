@@ -21,10 +21,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
       - name: Install Android 36 platform and upstream NDK
         run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            SDK_MANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -1)"
+            test -n "$SDK_MANAGER"
+            export PATH="$(dirname "$SDK_MANAGER"):$PATH"
+          fi
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install 'platforms;android-36' 'ndk;29.0.14206865'
       - name: Verify Android 17 Termux execution compatibility

@@ -16,6 +16,7 @@ import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A terminal session, consisting of a process coupled to a terminal interface.
@@ -32,6 +33,8 @@ public final class TerminalSession extends TerminalOutput {
 
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
+    // SM_A175N_PTY_BATCH_V1: reduce reader syscalls and main-thread message pressure.
+    private static final int PTY_READ_BUFFER_BYTES = 16 * 1024;
 
     public final String mHandle = UUID.randomUUID().toString();
 
@@ -41,7 +44,7 @@ public final class TerminalSession extends TerminalOutput {
      * A queue written to from a separate thread when the process outputs, and read by main thread to process by
      * terminal emulator.
      */
-    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(64 * 1024);
+    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(128 * 1024);
     /**
      * A queue written to from the main thread due to user interaction, and read by another thread which forwards by
      * writing to the {@link #mTerminalFileDescriptor}.
@@ -69,6 +72,15 @@ public final class TerminalSession extends TerminalOutput {
     public String mSessionName;
 
     final Handler mMainThreadHandler = new MainThreadHandler();
+    // At most one input notification in flight. Clear before reading to avoid
+    // lost wakeups if the PTY reader writes concurrently with the UI consumer.
+    private final AtomicBoolean mInputNotificationPending = new AtomicBoolean(false);
+
+    private void scheduleInputDrain() {
+        if (mInputNotificationPending.compareAndSet(false, true)) {
+            mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+        }
+    }
 
     private final String mShellPath;
     private final String mCwd;
@@ -134,12 +146,13 @@ public final class TerminalSession extends TerminalOutput {
             @Override
             public void run() {
                 try (InputStream termIn = new FileInputStream(terminalFileDescriptorWrapped)) {
-                    final byte[] buffer = new byte[4096];
+                    final byte[] buffer = new byte[PTY_READ_BUFFER_BYTES];
                     while (true) {
                         int read = termIn.read(buffer);
                         if (read == -1) return;
+                        if (read == 0) continue;
                         if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
-                        mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                        scheduleInputDrain();
                     }
                 } catch (Exception e) {
                     // Ignore, just shutting down.
@@ -340,10 +353,16 @@ public final class TerminalSession extends TerminalOutput {
 
         @Override
         public void handleMessage(Message msg) {
+            // Clear before consuming. Concurrent writes then re-post a drain.
+            if (msg.what == MSG_NEW_INPUT) mInputNotificationPending.set(false);
             int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
             if (bytesRead > 0) {
                 mEmulator.append(mReceiveBuffer, bytesRead);
                 notifyScreenUpdate();
+            }
+            // A full bounded batch may leave more output; yield and re-post.
+            if (msg.what == MSG_NEW_INPUT && bytesRead == mReceiveBuffer.length) {
+                scheduleInputDrain();
             }
 
             if (msg.what == MSG_PROCESS_EXITED) {
